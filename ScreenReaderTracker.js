@@ -1,42 +1,75 @@
 import { AccessibilityInfo, AppState } from 'react-native';
 
-// Screen reader tracker (step 1): detects TalkBack/VoiceOver and measures how long it is on.
+// Screen reader tracker v2: detects TalkBack/VoiceOver, times it, and builds a per-screen struggle report.
 
 let started = false;
 let srOn = false;
-let srSince = null;      // when the current "on" period began
-let srTotalMs = 0;       // completed "on" periods
-let toggles = 0;         // times the screen reader changed state
+let srPeriodStart = null; // start of the current "on" period (for display)
+let srCheckpoint = null;  // last time SR time was added up (for accounting)
+let srTotalMs = 0;
+let toggles = 0;
 let sessionStart = 0;
-let log = [];            // event rows
+let cur = null;           // visit in progress
+let visits = [];          // finished visits
+let events = [];          // raw event log
+let recent = [];          // recent presses, for repeat-tap detection
 let listeners = new Set();
 let subs = [];
 
 const now = () => Date.now();
+const emit = () => listeners.forEach((f) => f());
 
-function emit() {
-  listeners.forEach((fn) => fn());
-}
-
-function add(event, source) {
-  log.push({
+function logEvent(event, extra = {}) {
+  events.push({
     timestamp: new Date().toISOString(),
     event,
+    screen_name: cur ? cur.screen : '',
     screen_reader_on: srOn,
-    source,
-    total_on_ms: getState().totalOnMs,
+    detail: '',
+    duration_ms: '',
+    sr_ms: '',
+    ...extra,
   });
+}
+
+// Add the screen reader time that passed since the last checkpoint.
+function flushSr(t) {
+  if (srOn && srCheckpoint !== null) {
+    const d = t - srCheckpoint;
+    srTotalMs += d;
+    if (cur) cur.srMs += d;
+    srCheckpoint = t;
+  }
 }
 
 function applyState(enabled, source) {
   if (enabled === srOn) return;
   const t = now();
-  if (srOn && srSince !== null) srTotalMs += t - srSince; // close the "on" period
+  flushSr(t);
   srOn = enabled;
-  srSince = enabled ? t : null;
+  srPeriodStart = enabled ? t : null;
+  srCheckpoint = enabled ? t : null;
+  if (enabled && cur) cur.srSeen = true;
   toggles += 1;
-  add('screen_reader_state_changed', source);
+  logEvent('screen_reader_state_changed', { detail: source });
   emit();
+}
+
+function newVisit(name, t) {
+  return { screen: name, start: t, srMs: 0, srSeen: srOn, taps: 0, repeats: 0, errors: 0, backs: 0 };
+}
+
+function closeVisit(t) {
+  if (!cur) return;
+  flushSr(t);
+  const v = { ...cur, durationMs: t - cur.start };
+  visits.push(v);
+  logEvent('screen_visit', {
+    duration_ms: v.durationMs,
+    sr_ms: v.srMs,
+    detail: `taps=${v.taps};repeat_taps=${v.repeats};form_errors=${v.errors};back=${v.backs}`,
+  });
+  cur = null;
 }
 
 export async function start() {
@@ -44,20 +77,13 @@ export async function start() {
   started = true;
   sessionStart = now();
   srOn = await AccessibilityInfo.isScreenReaderEnabled();
-  srSince = srOn ? sessionStart : null;
-  add('session_start', 'init');
-
+  srPeriodStart = srOn ? sessionStart : null;
+  srCheckpoint = srOn ? sessionStart : null;
+  logEvent('session_start');
   subs.push(
-    AccessibilityInfo.addEventListener('screenReaderChanged', (enabled) =>
-      applyState(enabled, 'listener')
-    ),
-    // The user often switches TalkBack in Settings, which backgrounds the app.
-    // Re-check when the app returns so no change is missed.
+    AccessibilityInfo.addEventListener('screenReaderChanged', (e) => applyState(e, 'listener')),
     AppState.addEventListener('change', async (next) => {
-      if (next === 'active') {
-        const enabled = await AccessibilityInfo.isScreenReaderEnabled();
-        applyState(enabled, 'resume_check');
-      }
+      if (next === 'active') applyState(await AccessibilityInfo.isScreenReaderEnabled(), 'resume_check');
     })
   );
   emit();
@@ -65,26 +91,125 @@ export async function start() {
 
 export function stop() {
   if (!started) return;
-  add('session_end', 'stop');
+  closeVisit(now());
   subs.forEach((s) => s.remove());
   subs = [];
   started = false;
 }
 
+// ---- Screen and struggle tracking ----
+export function trackScreen(name) {
+  const t = now();
+  closeVisit(t);
+  cur = newVisit(name, t);
+  recent = [];
+  emit();
+}
+
+export function tap(id) {
+  if (!cur) return;
+  cur.taps += 1;
+  const t = now();
+  recent = recent.filter((r) => t - r.t < 3000);
+  recent.push({ id, t });
+  if (recent.filter((r) => r.id === id).length >= 3) {
+    cur.repeats += 1;
+    logEvent('struggle_signal', { detail: `repeat_tap:${id}` });
+  }
+}
+
+export function formError(field) {
+  if (!cur) return;
+  cur.errors += 1;
+  logEvent('struggle_signal', { detail: `form_error:${field}` });
+}
+
+export function backNav() {
+  if (!cur) return;
+  cur.backs += 1;
+  logEvent('struggle_signal', { detail: 'back_navigation' });
+}
+
+// ---- Reading the data ----
 export function getState() {
   const t = now();
-  const currentOnMs = srOn && srSince !== null ? t - srSince : 0;
   return {
     screenReaderOn: srOn,
-    currentOnMs,                    // length of the current "on" period
-    totalOnMs: srTotalMs + currentOnMs,
+    currentOnMs: srOn && srPeriodStart !== null ? t - srPeriodStart : 0,
+    totalOnMs: srTotalMs + (srOn && srCheckpoint !== null ? t - srCheckpoint : 0),
     toggles,
     sessionMs: started ? t - sessionStart : 0,
   };
 }
 
-export function getLog() {
-  return log.slice();
+function allVisits() {
+  const list = visits.slice();
+  if (cur) {
+    const t = now();
+    const extra = srOn && srCheckpoint !== null ? t - srCheckpoint : 0;
+    list.push({ ...cur, srMs: cur.srMs + extra, durationMs: t - cur.start });
+  }
+  return list;
+}
+
+const sec = (ms) => Math.round(ms / 100) / 10;
+
+// One row per screen, worst struggle first. Struggle signals only count for visits where a screen reader was on.
+export function getReportRows() {
+  const map = {};
+  allVisits().forEach((v) => {
+    const r = (map[v.screen] = map[v.screen] || {
+      screen_name: v.screen, visits: 0, sr_visits: 0, total_ms: 0, sr_ms: 0,
+      taps_sr: 0, repeat_taps_sr: 0, form_errors_sr: 0, back_navs_sr: 0,
+    });
+    r.visits += 1;
+    r.total_ms += v.durationMs;
+    r.sr_ms += v.srMs;
+    if (v.srSeen) {
+      r.sr_visits += 1;
+      r.taps_sr += v.taps;
+      r.repeat_taps_sr += v.repeats;
+      r.form_errors_sr += v.errors;
+      r.back_navs_sr += v.backs;
+    }
+  });
+  return Object.values(map)
+    .map((r) => {
+      const score = Math.round(r.sr_ms / 10000 + 3 * r.repeat_taps_sr + 2 * r.form_errors_sr + r.back_navs_sr);
+      return {
+        screen_name: r.screen_name,
+        visits: r.visits,
+        sr_visits: r.sr_visits,
+        total_time_s: sec(r.total_ms),
+        sr_time_s: sec(r.sr_ms),
+        avg_sr_visit_s: r.sr_visits ? sec(r.sr_ms / r.sr_visits) : 0,
+        taps_sr: r.taps_sr,
+        repeat_taps_sr: r.repeat_taps_sr,
+        form_errors_sr: r.form_errors_sr,
+        back_navs_sr: r.back_navs_sr,
+        struggle_score: score,
+        flag: score >= 10 ? 'STRUGGLE' : score >= 5 ? 'WATCH' : 'OK',
+      };
+    })
+    .sort((a, b) => b.struggle_score - a.struggle_score);
+}
+
+const esc = (v) => {
+  const s = v === undefined || v === null ? '' : String(v);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+const csv = (cols, rows) => [cols.join(','), ...rows.map((r) => cols.map((c) => esc(r[c])).join(','))].join('\n');
+
+export function toReportCsv() {
+  return csv(
+    ['screen_name', 'visits', 'sr_visits', 'total_time_s', 'sr_time_s', 'avg_sr_visit_s', 'taps_sr',
+     'repeat_taps_sr', 'form_errors_sr', 'back_navs_sr', 'struggle_score', 'flag'],
+    getReportRows()
+  );
+}
+
+export function toEventsCsv() {
+  return csv(['timestamp', 'event', 'screen_name', 'screen_reader_on', 'detail', 'duration_ms', 'sr_ms'], events);
 }
 
 export function subscribe(fn) {
@@ -93,21 +218,15 @@ export function subscribe(fn) {
 }
 
 export function reset() {
-  log = [];
+  visits = [];
+  events = [];
+  recent = [];
   srTotalMs = 0;
   toggles = 0;
   sessionStart = now();
-  srSince = srOn ? sessionStart : null;
-  add('session_reset', 'user');
+  srPeriodStart = srOn ? sessionStart : null;
+  srCheckpoint = srOn ? sessionStart : null;
+  if (cur) cur = newVisit(cur.screen, sessionStart);
+  logEvent('session_reset');
   emit();
-}
-
-const esc = (v) => {
-  const s = v === undefined || v === null ? '' : String(v);
-  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-};
-
-export function toCsv() {
-  const cols = ['timestamp', 'event', 'screen_reader_on', 'source', 'total_on_ms'];
-  return [cols.join(','), ...log.map((r) => cols.map((c) => esc(r[c])).join(','))].join('\n');
 }
